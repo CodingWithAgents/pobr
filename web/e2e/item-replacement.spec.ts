@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
-async function loadRings(page: Page) {
+async function loadRings(page: Page, includeAmulet = false) {
   await page.route('**/api/trade/leagues?realm=*', route => route.fulfill({ json: { leagues: ['Standard'] } }));
   await page.route('**/api/import/wegame', route => route.fulfill({ json: {
     format: 'wegame', version: 1, role: { level: 85, class_name: 'Sorceress' },
@@ -9,6 +9,7 @@ async function loadRings(page: Page) {
       { inventoryId: 'Weapon2', baseType: 'Ashen Staff', name: 'Alternate Staff', frameType: 2, explicitMods: ['40% increased Spell Damage'] },
       { inventoryId: 'Ring', baseType: 'Sapphire Ring', name: 'Strong Ring', frameType: 2, explicitMods: ['60% increased Fire Damage', '+80 to maximum Life'] },
       { inventoryId: 'Ring2', baseType: 'Sapphire Ring', name: 'Weak Ring', frameType: 2, explicitMods: ['+20 to maximum Life'] },
+      ...(includeAmulet ? [{ inventoryId: 'Amulet', baseType: 'Amber Amulet', frameType: 0 }] : []),
     ],
     talent_tree: { hashes: [], quest_stats: [] }, jewel_data: '[]',
     skills: [{ baseType: 'Fireball', support: false, properties: [{ type: 5, values: [['16', 0]] }] }],
@@ -27,12 +28,133 @@ const numeric = (text: string) => Number(text.replaceAll(',', ''));
 const savedState = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem('pobr-build-state')!).state);
 const copied = 'Item Class: Rings\nRarity: RARE\nMarket Candidate\nSapphire Ring\n--------\nRequirements:\nLevel: 60\nDex: 90\n--------\nItem Level: 100\nImplicits: 1\n+30% to Cold Resistance\n--------\n20% increased Fire Damage\n+100 to maximum Life';
 
+test('three-item search applies the complete result and changing its goal invalidates it', async ({ page }) => {
+  await loadRings(page, true);
+  const original = await savedState(page);
+  await page.getByRole('button', { name: 'Max Life', exact: true }).click();
+  const planner = page.locator('.equipment-planner');
+  for (const [name, slot] of [['First Ring', 'Ring 1'], ['Second Ring', 'Ring 2']]) {
+    await paste(page, copied.replace('Market Candidate', name).replace('+100 to maximum Life', '+150 to maximum Life'));
+    await expect(page.locator('.replacement-content')).toHaveAttribute('aria-busy', 'false');
+    await page.locator('.replacement-position').filter({ hasText: new RegExp(`^${slot}`) }).click();
+    await page.getByRole('button', { name: 'Add to combinations', exact: true }).click();
+  }
+  await paste(page, 'Rarity: RARE\nThird Item\nAmber Amulet\nImplicits: 0\n+100 to maximum Life');
+  await expect(page.locator('.replacement-content')).toHaveAttribute('aria-busy', 'false');
+  await page.getByRole('button', { name: 'Add to combinations', exact: true }).click();
+  await planner.getByRole('combobox', { name: 'Maximum replacements' }).selectOption('3');
+  const run = planner.getByRole('button', { name: 'Compare up to 3 items together', exact: true });
+  await run.click();
+  await expect(planner.locator('.equipment-plan-results')).toContainText('Plans calculated: 8');
+  const best = planner.locator('.equipment-plan').first();
+  await expect(best.locator('h5')).toContainText('Third Item');
+  await expect(best.locator('h5')).toContainText('First Ring');
+  await expect(best.locator('h5')).toContainText('Second Ring');
+  await page.getByRole('button', { name: 'Max total DPS', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Max Life', exact: true }).click();
+  await run.click();
+  await expect(best).toBeVisible();
+  const expectedLife = numeric(await best.locator('[data-plan-stat="Life"]').innerText());
+  await best.getByRole('button', { name: 'Apply equipment plan', exact: true }).click();
+  await expect.poll(async () => numeric(await page.locator('.stat-row').filter({ hasText: /^Life/ }).locator('dd').innerText())).toBeCloseTo(expectedLife, 0);
+  const after = await savedState(page);
+  expect(after.items.filter((item: { slot: string }) => ['ring1', 'ring2', 'amulet'].includes(item.slot))).toHaveLength(3);
+  expect(after.weaponSwap).toEqual(original.weaponSwap);
+});
+
 async function paste(page: Page, text: string) {
   await page.getByRole('textbox', { name: 'Complete item text' }).evaluate((element, value) => {
     const data = new DataTransfer(); data.setData('text/plain', value);
     element.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
   }, text);
 }
+
+test('joint equipment plans compare both ring placements, keep item identity, and apply the predicted complete build', async ({ page }) => {
+  await loadRings(page);
+  const original = await savedState(page);
+  const before = await dps(page).innerText();
+  await page.getByRole('button', { name: 'Max total DPS', exact: true }).click();
+  const planner = page.locator('.equipment-planner');
+  const addBothPositions = async (text: string) => {
+    await paste(page, text);
+    await expect(page.locator('.replacement-position')).toHaveCount(2);
+    await expect(page.locator('.replacement-content')).toHaveAttribute('aria-busy', 'false');
+    for (const name of ['Ring 1', 'Ring 2']) {
+      await page.locator('.replacement-position').filter({ hasText: new RegExp(`^${name}`) }).click();
+      await page.getByRole('button', { name: 'Add to combinations', exact: true }).click();
+      await expect(page.getByRole('button', { name: 'Added to combinations', exact: true })).toBeDisabled();
+    }
+  };
+  await addBothPositions(copied);
+  await planner.getByRole('button', { name: 'Compare one- and two-item plans', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toContainText('Plans calculated: 3');
+  await expect(planner.locator('.equipment-plan')).toHaveCount(3);
+  await addBothPositions(copied.replace('Market Candidate', 'Second Candidate').replace('20% increased Fire Damage', '90% increased Fire Damage').replace('+100 to maximum Life', '+150 to maximum Life'));
+  await expect(planner.locator('.equipment-plan-results')).toHaveCount(0);
+  await planner.getByRole('button', { name: 'Compare one- and two-item plans', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toContainText('Plans calculated: 7');
+  await expect(dps(page)).toHaveText(before);
+  expect((await savedState(page)).items).toEqual(original.items);
+  await page.getByRole('button', { name: 'Max Life', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toContainText('Plans calculated: 7');
+  await page.getByRole('button', { name: 'Max total DPS', exact: true }).click();
+  await expect(planner.locator('.equipment-plan').first().locator('h5')).toHaveText('Second Candidate · Ring 2');
+  await page.getByRole('button', { name: 'Max Life', exact: true }).click();
+  const best = planner.locator('.equipment-plan').first();
+  await expect(best.locator('h5')).toContainText('Market Candidate');
+  await expect(best.locator('h5')).toContainText('Second Candidate');
+  const expectedDps = numeric(await best.locator('[data-plan-stat="TotalDPS"]').innerText());
+  const expectedLife = numeric(await best.locator('[data-plan-stat="Life"]').innerText());
+  await best.getByRole('button', { name: 'Apply equipment plan', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toHaveCount(0);
+  await expect.poll(async () => numeric(await dps(page).innerText())).toBeCloseTo(expectedDps, 0);
+  await expect.poll(async () => numeric(await page.locator('.stat-row').filter({ hasText: /^Life/ }).locator('dd').innerText())).toBeCloseTo(expectedLife, 0);
+  const applied = await savedState(page);
+  const rings = applied.items.filter((item: { slot: string }) => item.slot === 'ring1' || item.slot === 'ring2');
+  expect(rings).toHaveLength(2);
+  expect(rings.filter((item: { text: string }) => item.text.includes('Market Candidate'))).toHaveLength(1);
+  expect(rings.filter((item: { text: string }) => item.text.includes('Second Candidate'))).toHaveLength(1);
+  expect(applied.items.filter((item: { slot: string }) => !item.slot.startsWith('ring')))
+    .toEqual(original.items.filter((item: { slot: string }) => !item.slot.startsWith('ring')));
+  expect(applied.weaponSwap).toEqual(original.weaponSwap);
+  await planner.getByRole('button', { name: 'Compare one- and two-item plans', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toBeVisible();
+  await page.getByRole('group', { name: 'Active weapon set' }).getByRole('button', { name: 'Set 2', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toHaveCount(0);
+  await expect(planner.getByRole('button', { name: 'Apply equipment plan', exact: true })).toHaveCount(0);
+});
+
+test('joint equipment candidates retain unmodeled effects and cannot apply an unverified plan', async ({ page }) => {
+  await loadRings(page);
+  const original = await savedState(page);
+  await paste(page, `${copied}\nUnmodeled synthetic effect`);
+  await expect(page.locator('.replacement-content')).toHaveAttribute('aria-busy', 'false');
+  await page.getByRole('button', { name: 'Add to combinations', exact: true }).click();
+  const planner = page.locator('.equipment-planner');
+  await planner.getByRole('button', { name: 'Compare one- and two-item plans', exact: true }).click();
+  await expect(planner.locator('.equipment-plan-results')).toBeVisible();
+  const candidate = planner.locator('.equipment-plan').filter({ hasText: 'Market Candidate' });
+  await expect(candidate).toContainText('Unmodeled synthetic effect');
+  await expect(candidate.getByRole('button', { name: 'Apply equipment plan', exact: true })).toBeDisabled();
+  expect((await savedState(page)).items).toEqual(original.items);
+  for (const [label, slot] of [['Verified A', 'Ring 1'], ['Verified B', 'Ring 2'], ['Verified C', 'Ring 1']]) {
+    await paste(page, copied.replace('Market Candidate', label));
+    await expect(page.locator('.replacement-content')).toHaveAttribute('aria-busy', 'false');
+    await page.locator('.replacement-position').filter({ hasText: new RegExp(`^${slot}`) }).click();
+    await page.getByRole('button', { name: 'Add to combinations', exact: true }).click();
+  }
+  await planner.getByRole('button', { name: 'Compare one- and two-item plans', exact: true }).click();
+  await expect(planner.locator('.equipment-plan')).toHaveCount(6);
+  await expect(candidate).toHaveCount(0);
+  const diagnostics = planner.locator('.equipment-plan-results > details');
+  await diagnostics.locator('summary').click();
+  await expect(diagnostics).toContainText('Market Candidate');
+  await expect(diagnostics).toContainText('Unmodeled synthetic effect');
+  await planner.getByRole('button', { name: /Remove candidate Market Candidate/ }).click();
+  await expect(planner.locator('.equipment-plan-results')).toHaveCount(0);
+  await expect(planner.locator('.equipment-candidates > li')).toHaveCount(3);
+});
 
 test('pasting detects both rings, recommends the actual better destination, and applies only the selected replacement', async ({ page }) => {
   await loadRings(page);
